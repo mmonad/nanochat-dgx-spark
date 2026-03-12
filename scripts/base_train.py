@@ -46,6 +46,8 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+# FP4 training (NVFP4 — cutting-edge, Blackwell only)
+parser.add_argument("--fp4", action="store_true", help="enable NVFP4 training (requires Blackwell GPU)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -179,52 +181,75 @@ if args.fp8:
         num_skipped = num_linear - num_fp8
         print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
 
-# Context manager to temporarily disable FP8 so that model evaluation remains in BF16
+# Convert Linear layers to Float4Linear if --fp4 is set
+if args.fp4:
+    if device_type != "cuda":
+        print0("Warning: FP4 training requires CUDA, ignoring --fp4 flag")
+    elif args.fp8:
+        print0("Warning: --fp4 and --fp8 are mutually exclusive, ignoring --fp4")
+    elif torch.cuda.get_device_capability()[0] < 10:
+        print0("Warning: NVFP4 training requires Blackwell (SM100+) GPU, ignoring --fp4 flag")
+    else:
+        from nanochat.fp4 import convert_to_float4_training
+        import torch.nn as nn
+
+        # Filter: both dims must be divisible by 32 because each dimension becomes
+        # the reduction dim (K) in one of the three training GEMMs, and NVFP4
+        # requires K % 32 == 0 for the packed format.
+        def fp4_module_filter(mod: nn.Module, fqn: str) -> bool:
+            if not isinstance(mod, nn.Linear):
+                return False
+            if mod.in_features % 32 != 0 or mod.out_features % 32 != 0:
+                return False
+            if min(mod.in_features, mod.out_features) < 128:
+                return False
+            return True
+
+        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+        convert_to_float4_training(model, module_filter_fn=fp4_module_filter)
+        num_fp4 = sum(1 for m in model.modules() if 'Float4' in type(m).__name__)
+        num_skipped = num_linear - num_fp4
+        print0(f"✓ NVFP4 training enabled - converted {num_fp4}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+
+# Context manager to temporarily disable quantized linear layers for BF16 evaluation
 @contextmanager
 def disable_fp8(model):
-    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
+    """Temporarily swap Float8Linear/Float4Linear with standard Linear for BF16 evaluation."""
 
-    CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
-    we swap out Float8Linear modules entirely and restore them after.
-    """
-    import torch.nn as nn
-
-    # Find all Float8Linear modules and their locations
-    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
+    # Find all quantized linear modules (Float8Linear or Float4Linear)
+    quant_locations = []  # list of (parent_module, attr_name, quant_module)
     for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__:
+        if 'Float8' in type(module).__name__ or 'Float4' in type(module).__name__:
             if '.' in name:
                 parent_name, attr_name = name.rsplit('.', 1)
                 parent = model.get_submodule(parent_name)
             else:
                 parent = model
                 attr_name = name
-            fp8_locations.append((parent, attr_name, module))
+            quant_locations.append((parent, attr_name, module))
 
-    if not fp8_locations:
-        yield  # No FP8 modules, nothing to do
+    if not quant_locations:
+        yield
         return
 
-    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
-    for parent, attr_name, fp8_module in fp8_locations:
+    for parent, attr_name, quant_module in quant_locations:
         linear = Linear(
-            fp8_module.in_features,
-            fp8_module.out_features,
-            bias=fp8_module.bias is not None,
-            device=fp8_module.weight.device,
-            dtype=fp8_module.weight.dtype,
+            quant_module.in_features,
+            quant_module.out_features,
+            bias=quant_module.bias is not None,
+            device=quant_module.weight.device,
+            dtype=quant_module.weight.dtype,
         )
-        linear.weight = fp8_module.weight  # share, don't copy
-        if fp8_module.bias is not None:
-            linear.bias = fp8_module.bias
+        linear.weight = quant_module.weight  # share, don't copy
+        if quant_module.bias is not None:
+            linear.bias = quant_module.bias
         setattr(parent, attr_name, linear)
 
     try:
         yield
     finally:
-        # Restore Float8Linear modules
-        for parent, attr_name, fp8_module in fp8_locations:
-            setattr(parent, attr_name, fp8_module)
+        for parent, attr_name, quant_module in quant_locations:
+            setattr(parent, attr_name, quant_module)
 
 # -----------------------------------------------------------------------------
 # Compile the model

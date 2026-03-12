@@ -12,6 +12,10 @@ export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-$CUDA_HOME/bin/ptxas}"
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 
+# Triton cache (ensure writable, especially on remote nodes)
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$HOME/.triton/cache}"
+mkdir -p "$TRITON_CACHE_DIR" 2>/dev/null
+
 # Memory optimization for unified memory architecture
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-max_split_size_mb:512}"
 

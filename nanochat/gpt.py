@@ -9,7 +9,7 @@ Notable features:
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
-- Flash Attention 3 integration
+- flex_attention for training, SDPA for inference
 """
 
 from functools import partial
@@ -22,8 +22,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
-# Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
-from nanochat.flash_attention import flash_attn
+from nanochat.flash_attention import flex_attn_func, sdpa_attn_func, sdpa_attn_with_kvcache, create_sliding_window_block_mask
 
 @dataclass
 class GPTConfig:
@@ -79,11 +78,10 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, block_mask=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -101,15 +99,16 @@ class CausalSelfAttention(nn.Module):
         q = q * 1.15  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.15
 
-        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if kv_cache is None and block_mask is not None:
+            # Training: flex_attention with precomputed block mask
+            y = flex_attn_func(q, k, v, block_mask=block_mask)
+        elif kv_cache is None:
+            # Training fallback (CPU/MPS or no block masks): SDPA
+            y = sdpa_attn_func(q, k, v, window_size=window_size)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
+            # Inference: SDPA with KV cache
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
+            y = sdpa_attn_with_kvcache(
                 q, k_cache, v_cache,
                 k=k, v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
@@ -145,8 +144,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, block_mask=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, block_mask=block_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -163,6 +162,7 @@ class GPT(nn.Module):
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
+        self._block_masks = None  # set by create_block_masks() for training
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -271,7 +271,7 @@ class GPT(nn.Module):
         """
         Compute per-layer window sizes for sliding window attention.
 
-        Returns list of (left, right) tuples for FA3's window_size parameter:
+        Returns list of (left, right) tuples for SDPA inference:
         - left: how many tokens before current position to attend to (-1 = unlimited)
         - right: how many tokens after current position to attend to (0 for causal)
 
@@ -280,9 +280,8 @@ class GPT(nn.Module):
         """
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
-        # Map characters to window sizes
         long_window = config.sequence_len
-        short_window = -(-long_window // 3 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
+        short_window = -(-long_window // 3 // 128) * 128  # ceil to 128-aligned ~1/3 of context
         char_to_window = {
             "L": (long_window, 0),
             "S": (short_window, 0),
@@ -295,6 +294,15 @@ class GPT(nn.Module):
         # Final layer always gets full context
         window_sizes[-1] = (long_window, 0)
         return window_sizes
+
+    def create_block_masks(self, device):
+        """Create flex_attention block masks for training (call after model is on device)."""
+        T = self.config.sequence_len
+        unique_windows = set(w[0] for w in self.window_sizes)
+        masks = {}
+        for w in unique_windows:
+            masks[w] = create_sliding_window_block_mask(T, w, device)
+        self._block_masks = [masks[ws[0]] for ws in self.window_sizes]
 
     def get_device(self):
         return self.transformer.wte.weight.device
@@ -414,7 +422,8 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            bm = self._block_masks[i] if self._block_masks is not None and kv_cache is None and T == self.config.sequence_len else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, block_mask=bm)
         x = norm(x)
 
         # Forward the lm_head (compute logits)

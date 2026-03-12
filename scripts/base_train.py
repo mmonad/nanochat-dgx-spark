@@ -13,6 +13,7 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas")
 import gc
 import json
 import time
@@ -32,7 +33,6 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -99,22 +99,8 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
-# Flash Attention status
-from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3
-if using_fa3:
-    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
-else:
-    print0("!" * 80)
-    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
-        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
-    else:
-        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
-    if args.window_pattern != "L":
-        print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
-        print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
-    print0("!" * 80)
+# Attention: flex_attention for training, SDPA for inference
+print0("Using flex_attention for training (sliding window via block masks)")
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
@@ -129,7 +115,7 @@ print0(f"Vocab size: {vocab_size:,}")
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
+    # (head_dim must be divisible by 8 for tensor cores, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
@@ -149,6 +135,8 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+if device_type == "cuda":
+    model.create_block_masks(device) # 4) Precompute flex_attention block masks for training
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()

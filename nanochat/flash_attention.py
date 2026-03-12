@@ -1,70 +1,54 @@
 """
-Unified Flash Attention interface with automatic FA3/SDPA switching.
+Unified attention interface for nanochat.
 
-Exports `flash_attn` module that matches the FA3 API exactly, but falls back
-to PyTorch SDPA on non-Hopper GPUs (including Blackwell), MPS, and CPU.
+Training: flex_attention with precomputed block masks (efficient sliding window on all GPUs)
+Inference: PyTorch SDPA with KV cache support
 
-Usage (drop-in replacement for FA3):
-    from nanochat.flash_attention import flash_attn
-
-    # Training (no KV cache)
-    y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-
-    # Inference (with KV cache)
-    y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
+Usage:
+    from nanochat.flash_attention import flex_attn_func, create_sliding_window_block_mask
+    from nanochat.flash_attention import sdpa_attn_with_kvcache
 """
 import torch
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 
 # =============================================================================
-# Detection: Try to load FA3 on Hopper+ GPUs
+# Training: flex_attention
 # =============================================================================
-def _load_flash_attention_3():
-    """Try to load Flash Attention 3 (requires Hopper GPU, sm90)."""
-    if not torch.cuda.is_available():
-        return None
-    try:
-        major, _ = torch.cuda.get_device_capability()
-        # FA3 kernels are compiled for Hopper (sm90) only
-        # Ada (sm89), Blackwell (sm100) need SDPA fallback until FA3 is recompiled
-        if major != 9:
-            return None
-        import os
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        from kernels import get_kernel
-        return get_kernel('varunneal/flash-attention-3').flash_attn_interface
-    except Exception:
-        return None
+def create_sliding_window_block_mask(seq_len, window_size, device):
+    """Create a flex_attention block mask for causal sliding window attention.
+
+    Args:
+        seq_len: sequence length
+        window_size: number of past tokens to attend to (full context if >= seq_len)
+        device: torch device
+    """
+    def mask_fn(b, h, q_idx, kv_idx, _w=window_size):
+        return (q_idx >= kv_idx) & (q_idx - kv_idx <= _w)
+    return create_block_mask(mask_fn, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
 
 
-_fa3 = _load_flash_attention_3()
-HAS_FA3 = _fa3 is not None
+def flex_attn_func(q, k, v, block_mask=None):
+    """
+    Training attention using flex_attention.
 
-# Override for testing: set to 'fa3', 'sdpa', or None (auto)
-_override_impl = None
+    Args:
+        q, k, v: Tensors of shape (B, T, H, D)
+        block_mask: precomputed flex_attention BlockMask
 
-
-def _resolve_use_fa3():
-    """Decide once whether to use FA3, based on availability, override, and dtype."""
-    if _override_impl == 'fa3':
-        assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
-        return True
-    if _override_impl == 'sdpa':
-        return False
-    if HAS_FA3:
-        # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use SDPA fallback
-        from nanochat.common import COMPUTE_DTYPE
-        if COMPUTE_DTYPE == torch.bfloat16:
-            return True
-        return False
-    return False
-
-USE_FA3 = _resolve_use_fa3()
+    Returns:
+        Output tensor of shape (B, T, H, D)
+    """
+    # flex_attention expects (B, H, T, D)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    enable_gqa = q.size(1) != k.size(1)
+    y = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
+    return y.transpose(1, 2)  # back to (B, T, H, D)
 
 
 # =============================================================================
-# SDPA helpers
+# Inference: SDPA with KV cache
 # =============================================================================
 def _sdpa_attention(q, k, v, window_size, enable_gqa):
     """
@@ -101,39 +85,28 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
-# =============================================================================
-# Public API: Same interface as FA3
-# =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+
+def sdpa_attn_func(q, k, v, window_size=(-1, -1)):
     """
-    Flash Attention for training (no KV cache).
+    Training attention using SDPA (fallback for CPU/MPS when flex_attention isn't available).
 
     Args:
         q, k, v: Tensors of shape (B, T, H, D)
-        causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
 
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if USE_FA3:
-        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
-
-    # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     enable_gqa = q.size(1) != k.size(1)
     y = _sdpa_attention(q, k, v, window_size, enable_gqa)
-    return y.transpose(1, 2)  # back to (B, T, H, D)
+    return y.transpose(1, 2)
 
 
-def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
+def sdpa_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
                             causal=False, window_size=(-1, -1)):
     """
-    Flash Attention with KV cache for inference.
-
-    FA3 updates k_cache/v_cache in-place. Our SDPA fallback does the same.
+    SDPA attention with KV cache for inference.
 
     Args:
         q: Queries, shape (B, T_new, H, D)
@@ -146,17 +119,11 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if USE_FA3:
-        return _fa3.flash_attn_with_kvcache(
-            q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
-            causal=causal, window_size=window_size
-        )
-
-    # SDPA fallback: manually manage KV cache
+    # Manually manage KV cache
     B, T_new, H, D = q.shape
     pos = cache_seqlens[0].item()  # assume uniform position across batch
 
-    # Insert new k, v into cache (in-place, matching FA3 behavior)
+    # Insert new k, v into cache (in-place)
     if k is not None and v is not None:
         k_cache[:, pos:pos+T_new, :, :] = k
         v_cache[:, pos:pos+T_new, :, :] = v
@@ -175,13 +142,3 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa)
 
     return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
-
-
-# =============================================================================
-# Export: flash_attn module interface (drop-in replacement for FA3)
-# =============================================================================
-from types import SimpleNamespace
-flash_attn = SimpleNamespace(
-    flash_attn_func=flash_attn_func,
-    flash_attn_with_kvcache=flash_attn_with_kvcache,
-)
